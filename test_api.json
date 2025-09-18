@@ -1,0 +1,7 @@
+{
+  "task": "transcribe",
+  "language": "ko",
+  "return_timestamps": true,
+  "temperature": 0.0,
+  "beam_size": 1
+}
