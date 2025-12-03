@@ -127,45 +127,95 @@ def initialize_whisper(config: WhisperConfig):
 
 def preprocess_audio(audio_file: UploadFile) -> np.ndarray:
     """오디오 파일 전처리 (webm 지원 포함)"""
+    tmp_file_path = None
     try:
         # 파일 확장자 확인
         file_extension = Path(audio_file.filename).suffix.lower()
         
-        # 임시 파일로 저장
+        # 임시 파일로 저장 (flush 보장)
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
             content = audio_file.file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail="Empty audio file")
+            
             tmp_file.write(content)
+            tmp_file.flush()  # 파일 내용을 디스크에 강제 쓰기
+            os.fsync(tmp_file.fileno())  # OS 레벨에서 디스크 동기화
             tmp_file_path = tmp_file.name
         
-        # webm 파일인 경우 ffmpeg로 wav로 변환
+        # 파일 크기 확인
+        file_size = os.path.getsize(tmp_file_path)
+        logger.info(f"Saved temp file: {tmp_file_path} ({file_size} bytes)")
+        
+        if file_size == 0:
+            if tmp_file_path and os.path.exists(tmp_file_path):
+                os.unlink(tmp_file_path)
+            raise HTTPException(status_code=400, detail="Audio file is empty")
+        
+        # webm 파일인 경우 처리
         if file_extension == '.webm':
-            logger.info("Converting webm to wav using ffmpeg...")
-            tmp_wav_path = tmp_file_path.replace('.webm', '_converted.wav')
+            logger.info(f"Processing WebM file: {file_size} bytes")
             
+            # 방법 1: librosa가 직접 읽을 수 있는지 시도 (ffmpeg 백엔드 사용)
             try:
-                # ffmpeg로 webm → wav 변환 (16kHz, mono)
-                subprocess.run([
-                    'ffmpeg', '-i', tmp_file_path,
-                    '-ar', '16000',  # 16kHz 샘플링
-                    '-ac', '1',      # 모노
-                    '-y',            # 덮어쓰기
-                    tmp_wav_path
-                ], check=True, capture_output=True)
+                logger.info("Attempting to load WebM directly with librosa...")
+                audio, sr = librosa.load(tmp_file_path, sr=16000, mono=True)
+                os.unlink(tmp_file_path)
+                logger.info(f"WebM loaded directly: duration={len(audio)/16000:.2f}s")
+                return audio
+            except Exception as librosa_error:
+                logger.warning(f"Direct librosa load failed: {librosa_error}")
                 
-                # 원본 webm 파일 삭제
-                os.unlink(tmp_file_path)
-                tmp_file_path = tmp_wav_path
-                logger.info("WebM conversion successful")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-                os.unlink(tmp_file_path)
-                raise HTTPException(status_code=400, detail="Failed to convert webm file")
+                # 방법 2: ffmpeg로 명시적 변환
+                logger.info("Trying ffmpeg conversion...")
+                tmp_wav_path = tmp_file_path.replace('.webm', '_converted.wav')
+                
+                try:
+                    # ffmpeg로 webm → wav 변환 (더 관대한 옵션)
+                    result = subprocess.run([
+                        'ffmpeg',
+                        '-loglevel', 'error',  # 에러만 출력
+                        '-i', tmp_file_path,
+                        '-ar', '16000',  # 16kHz 샘플링
+                        '-ac', '1',      # 모노
+                        '-f', 'wav',     # 출력 포맷 명시
+                        '-y',            # 덮어쓰기
+                        tmp_wav_path
+                    ], capture_output=True, text=True, timeout=10)
+                    
+                    if result.returncode == 0 and os.path.exists(tmp_wav_path):
+                        os.unlink(tmp_file_path)
+                        tmp_file_path = tmp_wav_path
+                        logger.info("FFmpeg conversion successful")
+                    else:
+                        error_msg = result.stderr if result.stderr else "Unknown ffmpeg error"
+                        logger.error(f"FFmpeg failed: {error_msg}")
+                        if os.path.exists(tmp_file_path):
+                            os.unlink(tmp_file_path)
+                        if os.path.exists(tmp_wav_path):
+                            os.unlink(tmp_wav_path)
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"WebM conversion failed. File may be corrupted or incomplete. Try recording again."
+                        )
+                        
+                except subprocess.TimeoutExpired:
+                    logger.error("FFmpeg conversion timeout")
+                    if os.path.exists(tmp_file_path):
+                        os.unlink(tmp_file_path)
+                    raise HTTPException(status_code=400, detail="Audio conversion timeout")
+                except Exception as ffmpeg_error:
+                    logger.error(f"FFmpeg conversion error: {ffmpeg_error}")
+                    if os.path.exists(tmp_file_path):
+                        os.unlink(tmp_file_path)
+                    raise HTTPException(status_code=400, detail="Failed to process WebM file")
         
         # librosa로 오디오 로드 (16kHz로 리샘플링)
         audio, sr = librosa.load(tmp_file_path, sr=16000, mono=True)
         
         # 임시 파일 삭제
-        os.unlink(tmp_file_path)
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
         
         logger.info(f"Audio processed: duration={len(audio)/16000:.2f}s, sr={sr}")
         return audio
@@ -174,6 +224,12 @@ def preprocess_audio(audio_file: UploadFile) -> np.ndarray:
         raise
     except Exception as e:
         logger.error(f"Audio preprocessing failed: {str(e)}")
+        # 임시 파일 정리
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            try:
+                os.unlink(tmp_file_path)
+            except:
+                pass
         raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
 
 @app.on_event("startup")
