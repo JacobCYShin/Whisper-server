@@ -3,6 +3,7 @@
 # written by ANDY
 
 import os
+import subprocess
 import torch
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA device count: {torch.cuda.device_count()}")
@@ -125,13 +126,40 @@ def initialize_whisper(config: WhisperConfig):
         raise e
 
 def preprocess_audio(audio_file: UploadFile) -> np.ndarray:
-    """오디오 파일 전처리"""
+    """오디오 파일 전처리 (webm 지원 포함)"""
     try:
+        # 파일 확장자 확인
+        file_extension = Path(audio_file.filename).suffix.lower()
+        
         # 임시 파일로 저장
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{audio_file.filename.split('.')[-1]}") as tmp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
             content = audio_file.file.read()
             tmp_file.write(content)
             tmp_file_path = tmp_file.name
+        
+        # webm 파일인 경우 ffmpeg로 wav로 변환
+        if file_extension == '.webm':
+            logger.info("Converting webm to wav using ffmpeg...")
+            tmp_wav_path = tmp_file_path.replace('.webm', '_converted.wav')
+            
+            try:
+                # ffmpeg로 webm → wav 변환 (16kHz, mono)
+                subprocess.run([
+                    'ffmpeg', '-i', tmp_file_path,
+                    '-ar', '16000',  # 16kHz 샘플링
+                    '-ac', '1',      # 모노
+                    '-y',            # 덮어쓰기
+                    tmp_wav_path
+                ], check=True, capture_output=True)
+                
+                # 원본 webm 파일 삭제
+                os.unlink(tmp_file_path)
+                tmp_file_path = tmp_wav_path
+                logger.info("WebM conversion successful")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
+                os.unlink(tmp_file_path)
+                raise HTTPException(status_code=400, detail="Failed to convert webm file")
         
         # librosa로 오디오 로드 (16kHz로 리샘플링)
         audio, sr = librosa.load(tmp_file_path, sr=16000, mono=True)
@@ -142,6 +170,8 @@ def preprocess_audio(audio_file: UploadFile) -> np.ndarray:
         logger.info(f"Audio processed: duration={len(audio)/16000:.2f}s, sr={sr}")
         return audio
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Audio preprocessing failed: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Audio preprocessing failed: {str(e)}")
@@ -174,7 +204,7 @@ async def transcribe_audio(
             raise HTTPException(status_code=500, detail="Whisper pipeline not loaded")
         
         # 파일 확장자 검증
-        allowed_extensions = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.aac', '.wma'}
+        allowed_extensions = {'.wav', '.mp3', '.m4a', '.flac', '.ogg', '.aac', '.wma', '.webm'}
         file_extension = Path(audio.filename).suffix.lower()
         if file_extension not in allowed_extensions:
             raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_extension}")
